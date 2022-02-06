@@ -1,11 +1,12 @@
 from torch.utils.data import Dataset
 import torch
+from torchvision import transforms
 import os
 from PIL import Image
 import numpy as np
 from matplotlib import pyplot as plt
 import seaborn as sns
-
+import glob
 import time
 
 
@@ -33,18 +34,42 @@ def timeit_torch(func):
         return arg
     return wrapper
 
+def categorical_iou(preds,labels):
+    '''
+
+    :param preds: tensor shape (B,C,H,W) between [0,1]
+    :param labels: tensor shape (B,C,H,W) between [0,1]
+    :return: value beteen [0,1]
+    '''
+    intersection = (preds*labels).sum()
+    union = (preds+labels).clip(0,1).sum()
+    return intersection/union
+
+
+def df_steel_to_pivot(df):
+    df = df.fillna(False)
+    #df['ImageId'] = df['ImageId_ClassId'].apply(lambda x: x.split('_')[0])
+    #df['ClassId'] = df['ImageId_ClassId'].apply(lambda x: x.split('_')[1])
+    #df= df.drop(['ImageId_ClassId'],1)
+    df = df[['ImageId','ClassId','EncodedPixels']].reset_index().drop(['index'],True)
+    df_pivot = df.pivot('ImageId','ClassId','EncodedPixels')
+    df_pivot.fillna(False,inplace=True)
+    df_pivot = df_pivot.reset_index()
+    return df_pivot
+
 
 def mask2rle(img):
     """
-    img: numpy array, 1 - mask, 0 - background
+    img: numpy array, 1 - mask, 0 - background, (width,height)
     Returns run length as string formatted
     """
+    assert len(img.shape) == 2, f"Error: Image has wrong dimensions: {img.shape}"
+
     pixels = img.flatten()
     pixels = np.concatenate([[0], pixels, [0]])
     runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
     runs[1::2] -= runs[::2]
     return ' '.join(str(x) for x in runs)
-
 
 def rle2mask(mask_rle: str, label=1, shape=(1600,256)):
     """
@@ -64,7 +89,6 @@ def rle2mask(mask_rle: str, label=1, shape=(1600,256)):
 
 def tensor_to_set(tensor):
     return set(tensor.flatten().tolist())
-
 
 def masks_to_one_hot(masks, N):
     '''
@@ -159,7 +183,7 @@ def img_mask_overlay(imgs, masks, figsize=1, alpha=0.5, colors=None):
 
 class SteelDataset(Dataset):
 
-    def __init__(self, root_dir, df, nr_classes, img_size=(256, 1600), transform=None):
+    def __init__(self, root_dir, df, nr_classes, transform=None,mask_transform = None, aug_transform = None):
         """
         Args:
             dataframe: a pandas dataframe.
@@ -172,8 +196,9 @@ class SteelDataset(Dataset):
         self.root_dir = root_dir
         self.df = df
         self.transform = transform
-        self.img_size = img_size
         self.nr_classes = nr_classes
+        self.mask_transform = mask_transform
+        self.aug_transform = aug_transform
 
     def _rle2mask(self, mask_rle: str, label=1, shape=(1600, 256)):
         """
@@ -191,8 +216,14 @@ class SteelDataset(Dataset):
             mask[lo:hi] = label
         return mask.reshape(shape).T  # Needed to align to RLE direction
 
+
     def _load_mask_one_hot(self, mask, nr_categories):
-        assert mask.shape == (self.img_size[0], self.img_size[1]), "Error: mask.shape is {}".format(mask.shape)
+        """
+        :param mask tensor, shape (height,width)
+
+        :returns one hot mask, shape (nr_categories, height,width)
+        """
+        #assert mask.shape == (self.img_size[0], self.img_size[1]), "Error: mask.shape is {}".format(mask.shape)
 
         mask = mask.to(torch.int64)
         mask_one_hot = torch.nn.functional.one_hot(mask, nr_categories + 1).squeeze()
@@ -203,12 +234,10 @@ class SteelDataset(Dataset):
 
         return mask_one_hot[:, 1:, :, :]
 
-    def _load_img(self, img_name):
+    def _load_img(self, img_path):
 
-        img_path = os.path.join(self.root_dir, img_name)
         img_pil = Image.open(img_path)
-        img_tensor = torch.tensor(np.array(img_pil)) / 255.0
-        return torch.permute(img_tensor, (2, 0, 1))
+        return img_pil
 
     def __len__(self):
         return len(self.df)
@@ -218,22 +247,40 @@ class SteelDataset(Dataset):
             idx = idx.tolist()
 
         img_name = self.df.iloc[idx, 0]
+        img_path = os.path.join(self.root_dir, img_name)
+        image_pil = self._load_img(img_path)
 
-        image = self._load_img(img_name)
-
-        mask = torch.zeros((1, self.nr_classes, self.img_size[0], self.img_size[1]))
+        mask_rle_combined = np.zeros((256, 1600))
         label = torch.zeros((self.nr_classes))
         for category in range(1, self.nr_classes + 1):
             pxcode = self.df.iloc[idx, category]
             pxcode = False if pxcode == 'False' else pxcode
             if pxcode:
                 mask_rle = self._rle2mask(pxcode, category)
-                mask_rle = torch.tensor(mask_rle)
-                mask += self._load_mask_one_hot(mask_rle, self.nr_classes)
+                mask_rle_combined += mask_rle
                 label[category - 1] = 1
-        mask = mask.squeeze()
-        assert mask.shape == (self.nr_classes, self.img_size[0], self.img_size[1]), "Error, mask shape is {}".format(
-            mask.shape)
 
-        return image, mask, label
+        mask_pil = Image.fromarray(mask_rle_combined)
+        mask_np = np.array(mask_pil)
+        image_np = np.array(image_pil)
+        if self.aug_transform:
+            augmented = self.aug_transform(image=image_np, mask=mask_np)
+        else:
+            augmented = {'image':image_np,'mask':mask_np}
+
+        image_augmented_pil = Image.fromarray(augmented['image'])
+        mask_augmented_pil = Image.fromarray(augmented['mask'])
+
+
+        mask_trafo = self.mask_transform(mask_augmented_pil).squeeze()
+
+        mask_one_hot = self._load_mask_one_hot(mask_trafo, self.nr_classes)
+
+        mask_out = mask_one_hot.squeeze()
+
+
+        image_torch = self.transform(image_augmented_pil)
+
+
+        return image_torch, mask_out, label
 
